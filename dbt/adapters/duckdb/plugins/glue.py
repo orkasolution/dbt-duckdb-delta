@@ -1,3 +1,4 @@
+import re
 from typing import Any
 from typing import Dict
 from typing import List
@@ -16,6 +17,7 @@ from mypy_boto3_glue.type_defs import TableInputTypeDef
 from . import BasePlugin
 from ..utils import TargetConfig
 from dbt.adapters.base.column import Column
+from dbt.adapters.duckdb.secrets import Secret
 
 
 class UnsupportedFormatType(Exception):
@@ -64,6 +66,16 @@ def _dbt2glue(dtype: str, ignore_null: bool = False) -> str:  # pragma: no cover
         return "date"
     if data_type.lower() in ["blob", "bytea", "binary", "varbinary"]:
         return "binary"
+    if data_type.lower() in ["struct"]:
+        struct_fields = re.findall(r"(\w+)\s+(\w+)", dtype[dtype.find("(") + 1 : dtype.rfind(")")])
+        glue_fields = []
+        for field_name, field_type in struct_fields:
+            glue_field_type = _dbt2glue(field_type)
+            glue_fields.append(f"{field_name}:{glue_field_type}")
+        struct_schema = f"struct<{','.join(glue_fields)}>"
+        if dtype.strip().endswith("[]"):
+            return f"array<{struct_schema}>"
+        return struct_schema
     if data_type is None:
         if ignore_null:
             return ""
@@ -215,7 +227,7 @@ def _add_partition_columns(
     # Remove columns from StorageDescriptor if they match with partition columns to avoid duplicate columns
     for p_column in partition_columns:
         table_def["StorageDescriptor"]["Columns"] = [
-            column
+            column  # type: ignore
             for column in table_def["StorageDescriptor"]["Columns"]
             if not (column["Name"] == p_column["Name"] and column["Type"] == p_column["Type"])
         ]
@@ -263,17 +275,34 @@ def _get_table_def(
     return table_def
 
 
-def _get_glue_client(settings: Dict[str, Any]) -> "GlueClient":
-    if settings:
-        return boto3.client(
-            "glue",
-            aws_access_key_id=settings.get("s3_access_key_id"),
-            aws_secret_access_key=settings.get("s3_secret_access_key"),
-            aws_session_token=settings.get("s3_session_token"),
-            region_name=settings.get("s3_region"),
-        )
-    else:
-        return boto3.client("glue")
+def _get_glue_client(
+    settings: Dict[str, Any], secrets: Optional[List[Dict[str, Any]]]
+) -> "GlueClient":
+    client = None
+    if secrets is not None:
+        for secret in secrets:
+            if isinstance(secret, Secret) and "config" == str(secret.provider).lower():
+                secret_kwargs = secret.secret_kwargs or {}
+                client = boto3.client(
+                    "glue",
+                    aws_access_key_id=secret_kwargs.get("key_id"),
+                    aws_secret_access_key=secret_kwargs.get("secret"),
+                    aws_session_token=secret_kwargs.get("session_token"),
+                    region_name=secret_kwargs.get("region"),
+                )
+                break
+    if client is None:
+        if settings:
+            client = boto3.client(
+                "glue",
+                aws_access_key_id=settings.get("s3_access_key_id"),
+                aws_secret_access_key=settings.get("s3_secret_access_key"),
+                aws_session_token=settings.get("s3_session_token"),
+                region_name=settings.get("s3_region"),
+            )
+        else:
+            client = boto3.client("glue")
+    return client
 
 
 def create_or_update_table(
@@ -327,7 +356,10 @@ def create_or_update_table(
 
 class Plugin(BasePlugin):
     def initialize(self, config: Dict[str, Any]):
-        self.client = _get_glue_client(config)
+        secrets: Optional[List[Dict[str, Any]]] = (
+            self.creds.secrets if self.creds is not None else None
+        )
+        self.client = _get_glue_client(config, secrets)
         self.database = config.get("glue_database", "default")
         self.delimiter = config.get("delimiter", ",")
 

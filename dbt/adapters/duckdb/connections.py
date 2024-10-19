@@ -1,29 +1,36 @@
 import atexit
 import threading
 from contextlib import contextmanager
+from multiprocessing.context import SpawnContext
 from typing import Optional
+from typing import Set
 from typing import Tuple
-
-import agate
+from typing import TYPE_CHECKING
 
 import dbt.exceptions
 from . import environments
+from dbt.adapters.contracts.connection import AdapterRequiredConfig
+from dbt.adapters.contracts.connection import AdapterResponse
+from dbt.adapters.contracts.connection import Connection
+from dbt.adapters.contracts.connection import ConnectionState
+from dbt.adapters.events.logging import AdapterLogger
 from dbt.adapters.sql import SQLConnectionManager
-from dbt.contracts.connection import AdapterRequiredConfig
-from dbt.contracts.connection import AdapterResponse
-from dbt.contracts.connection import Connection
-from dbt.contracts.connection import ConnectionState
-from dbt.logger import GLOBAL_LOGGER as logger
+
+logger = AdapterLogger("DuckDB")
+
+if TYPE_CHECKING:
+    import agate
 
 
 class DuckDBConnectionManager(SQLConnectionManager):
     TYPE = "duckdb"
     _LOCK = threading.RLock()
     _ENV = None
+    _LOGGED_MESSAGES: Set[str] = set()
 
-    def __init__(self, profile: AdapterRequiredConfig):
-        super().__init__(profile)
-        self.disable_transactions = profile.credentials.disable_transactions  # type: ignore
+    def __init__(self, config: AdapterRequiredConfig, mp_context: SpawnContext) -> None:
+        super().__init__(config, mp_context)
+        self.disable_transactions = config.credentials.disable_transactions  # type: ignore
 
     @classmethod
     def env(cls) -> environments.Environment:
@@ -50,7 +57,7 @@ class DuckDBConnectionManager(SQLConnectionManager):
                 logger.debug("Got an error when attempting to connect to DuckDB: '{}'".format(e))
                 connection.handle = None
                 connection.state = ConnectionState.FAIL
-                raise dbt.exceptions.FailedToConnectError(str(e))
+                raise dbt.adapters.exceptions.FailedToConnectError(str(e))
 
             return connection
 
@@ -63,8 +70,24 @@ class DuckDBConnectionManager(SQLConnectionManager):
         connection = super(SQLConnectionManager, cls).close(connection)
         return connection
 
-    def cancel(self, connection):
-        pass
+    @classmethod
+    def warn_once(cls, msg: str):
+        """Post a warning message once per dbt execution."""
+        with cls._LOCK:
+            if msg in cls._LOGGED_MESSAGES:
+                return
+            cls._LOGGED_MESSAGES.add(msg)
+            logger.warning(msg)
+
+    def cancel(self, connection: Connection):
+        if self._ENV is not None:
+            logger.debug(
+                "cancelling query on connection {}. Details: {}".format(
+                    connection.name, connection
+                )
+            )
+            self._ENV.cancel(connection)
+            logger.debug("query cancelled on connection {}".format(connection.name))
 
     @contextmanager
     def exception_handler(self, sql: str, connection_name="master"):
@@ -101,7 +124,7 @@ class DuckDBConnectionManager(SQLConnectionManager):
         auto_begin: bool = False,
         fetch: bool = False,
         limit: Optional[int] = None,
-    ) -> Tuple[AdapterResponse, agate.Table]:
+    ) -> Tuple[AdapterResponse, "agate.Table"]:
         if self.disable_transactions:
             auto_begin = False
         return super().execute(sql, auto_begin, fetch, limit)
