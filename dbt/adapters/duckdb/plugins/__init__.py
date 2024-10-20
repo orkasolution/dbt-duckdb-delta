@@ -4,13 +4,13 @@ from typing import Any
 from typing import Dict
 from typing import Optional
 
+from dbt_common.dataclass_schema import dbtClassMixin
 from duckdb import DuckDBPyConnection
 from duckdb import DuckDBPyRelation
 
 from ..credentials import DuckDBCredentials
 from ..utils import SourceConfig
 from ..utils import TargetConfig
-from dbt.dataclass_schema import dbtClassMixin
 
 
 class PluginConfig(dbtClassMixin):
@@ -38,6 +38,7 @@ class BasePlugin:
         *,
         config: Optional[Dict[str, Any]] = None,
         alias: Optional[str] = None,
+        credentials: Optional[DuckDBCredentials] = None,
     ) -> "BasePlugin":
         """
         Create a plugin from a module name and optional configuration.
@@ -62,12 +63,22 @@ class BasePlugin:
         except ImportError as e:
             raise ImportError(f"Unable to import module '{module}': {e}")
 
+        if config is None and credentials is not None:
+            config = credentials.settings
+
         if not hasattr(mod, "Plugin"):
             raise ImportError(f"Module '{module}' does not have a Plugin class.")
         else:
-            return mod.Plugin(alias or name, config or {})
+            return mod.Plugin(
+                name=alias or name, plugin_config=config or {}, credentials=credentials
+            )
 
-    def __init__(self, name: str, plugin_config: Dict[str, Any]):
+    def __init__(
+        self,
+        name: str,
+        plugin_config: Dict[str, Any],
+        credentials: Optional[DuckDBCredentials] = None,
+    ):
         """
         Initialize the BasePlugin instance with a name and its configuration.
         This method should *not* be overriden by subclasses in general; any
@@ -75,9 +86,11 @@ class BasePlugin:
         defined in the `initialize` method.
 
         :param name: A string representing the plugin name.
+        :param credentials: The DuckDB credentials
         :param plugin_config: A dictionary representing the plugin configuration.
         """
         self.name = name
+        self.creds = credentials
         self.initialize(plugin_config)
 
     def initialize(self, plugin_config: Dict[str, Any]):

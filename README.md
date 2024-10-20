@@ -52,16 +52,33 @@ or the Python API.
 MotherDuck databases generally work the same way as local DuckDB databases from the perspective of dbt, but
 there are a [few differences to be aware of](https://motherduck.com/docs/architecture-and-capabilities#considerations-and-limitations):
 1. Currently, MotherDuck _requires_ a specific version of DuckDB, often the latest, as specified in [MotherDuck's documentation](https://motherduck.com/docs/intro/#getting-started)
-1. MotherDuck databases do not suppport transactions, so there is a new `disable_transactions` profile.
-option that will be automatically enabled if you are connecting to a MotherDuck database in your `path`.
 1. MotherDuck preloads a set of the most common DuckDB extensions for you, but does not support loading custom extensions or user-defined functions.
 1. A small subset of advanced SQL features are currently unsupported; the only impact of this on the dbt adapter is that the [dbt.listagg](https://docs.getdbt.com/reference/dbt-jinja-functions/cross-database-macros#listagg) macro and foreign-key constraints will work against a local DuckDB database, but will not work against a MotherDuck database.
 
 #### DuckDB Extensions, Settings, and Filesystems
 
-You can load any supported [DuckDB extensions](https://duckdb.org/docs/extensions/overview) by listing them in
-the `extensions` field in your profile. You can also set any additional [DuckDB configuration options](https://duckdb.org/docs/sql/configuration)
-via the `settings` field, including options that are supported in any loaded extensions. For example, to be able to connect to S3 and read/write
+You can install and load any core [DuckDB extensions](https://duckdb.org/docs/extensions/overview) by listing them in
+the `extensions` field in your profile as a string. You can also set any additional [DuckDB configuration options](https://duckdb.org/docs/sql/configuration)
+via the `settings` field, including options that are supported in the loaded extensions. You can also configure extensions from outside of the core
+extension repository (e.g., a community extension) by configuring the extension as a `name`/`repo` pair:
+
+```
+default:
+  outputs:
+    dev:
+      type: duckdb
+      path: /tmp/dbt.duckdb
+      extensions:
+        - httpfs
+        - parquet
+        - name: h3
+          repo: community
+        - name: uc_catalog
+          repo: core_nightly
+  target: dev
+```
+
+To use the [DuckDB Secrets Manager](https://duckdb.org/docs/configuration/secrets_manager.html), you can use the `secrets` field. For example, to be able to connect to S3 and read/write
 Parquet files using an AWS access key and secret, your profile would look something like this:
 
 ```
@@ -73,10 +90,11 @@ default:
       extensions:
         - httpfs
         - parquet
-      settings:
-        s3_region: my-aws-region
-        s3_access_key_id: "{{ env_var('S3_ACCESS_KEY_ID') }}"
-        s3_secret_access_key: "{{ env_var('S3_SECRET_ACCESS_KEY') }}"
+      secrets:
+        - type: s3
+          region: my-aws-region
+          key_id: "{{ env_var('S3_ACCESS_KEY_ID') }}"
+          secret: "{{ env_var('S3_SECRET_ACCESS_KEY') }}"
   target: dev
 ```
 
@@ -107,7 +125,23 @@ to load (so `s3`, `gcs`, `abfs`, etc.) and then an arbitrary set of other key-va
 illustrates the usage of this feature to connect to a Localstack instance running S3 from dbt-duckdb [here](https://github.com/jwills/s3-demo).
 
 #### Fetching credentials from context
-Instead of specifying the credentials through the settings block, you can also use the use_credential_provider property. If you set this to `aws` (currently the only supported implementation) and you have `boto3` installed in your python environment, we will fetch your AWS credentials using the credential provider chain as described [here](https://boto3.amazonaws.com/v1/documentation/api/latest/guide/credentials.html). This means that you can use any supported mechanism from AWS to obtain credentials (e.g., web identity tokens).
+
+Instead of specifying the credentials through the settings block, you can also use the `CREDENTIAL_CHAIN` secret provider. This means that you can use any supported mechanism from AWS to obtain credentials (e.g., web identity tokens). You can read more about the secret providers [here](https://duckdb.org/docs/configuration/secrets_manager.html#secret-providers). To use the `CREDENTIAL_CHAIN` provider and automatically fetch credentials from AWS, specify the `provider` in the `secrets` key:
+
+```
+default:
+  outputs:
+    dev:
+      type: duckdb
+      path: /tmp/dbt.duckdb
+      extensions:
+        - httpfs
+        - parquet
+      secrets:
+        - type: s3
+          provider: credential_chain
+  target: dev
+```
 
 #### Attaching Additional Databases
 
@@ -206,7 +240,10 @@ them from the database first.
 #### Reading from external files
 
 You may reference external files in your dbt models either directly or as dbt `source`s by configuring the `external_location`
-meta option on the source:
+in either the `meta` or the `config` option on the source definition. The difference is that settings under the `meta` option
+will be propagated to the documentation for the source generated via `dbt docs generate`, but the settings under the `config`
+option will not be. Any source settings that should be excluded from the docs should be specified via `config`, while any
+options that you would like to be included in the generated documentation should live under `meta`.
 
 ```
 sources:
@@ -244,7 +281,7 @@ sources:
     tables:
       - name: source1
       - name: source2
-        meta:
+        config:
           external_location: "read_parquet(['s3://my-bucket/my-sources/source2a.parquet', 's3://my-bucket/my-sources/source2b.parquet'])"
 ```
 
@@ -270,7 +307,7 @@ sources:
   - name: flights_source
     tables:
       - name: flights
-        meta:
+        config:
           external_location: "read_csv('flights.csv', types={'FlightDate': 'DATE'}, names=['FlightDate', 'UniqueCarrier'])"
           formatter: oldstyle
 ```

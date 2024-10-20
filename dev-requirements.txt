@@ -1,21 +1,21 @@
-# install latest changes in dbt-core
+# install latest changes in dbt-core + dbt-tests-adapter
 # git+https://github.com/dbt-labs/dbt-core.git#egg=dbt-core&subdirectory=core
-# git+https://github.com/dbt-labs/dbt-core.git#egg=dbt-tests-adapter&subdirectory=tests/adapter
+# git+https://github.com/dbt-labs/dbt-adapters.git#subdirectory=dbt-tests-adapter
 
-dbt-tests-adapter==1.7.10
+dbt-tests-adapter==1.10.2
 
 boto3
 mypy-boto3-glue
 pandas
 pyarrow
-buenavista
+buenavista==0.5.0
 bumpversion
 flaky
-freezegun==1.4.0
+freezegun==1.5.1
 fsspec
 gspread
 ipdb
-mypy==1.9.0
+mypy==1.11.2
 openpyxl
 pip-tools
 pre-commit

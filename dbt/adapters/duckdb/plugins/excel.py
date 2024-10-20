@@ -10,6 +10,9 @@ from pandas.io.formats import excel
 from . import BasePlugin
 from ..utils import SourceConfig
 from ..utils import TargetConfig
+from dbt.adapters.events.logging import AdapterLogger
+
+logger = AdapterLogger("DuckDB")
 
 
 class Plugin(BasePlugin):

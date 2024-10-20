@@ -1,18 +1,19 @@
 import os
-import time
 from dataclasses import dataclass
 from dataclasses import field
-from functools import lru_cache
 from typing import Any
 from typing import Dict
 from typing import List
 from typing import Optional
-from typing import Tuple
+from typing import Union
 from urllib.parse import urlparse
 
-import dbt.exceptions
-from dbt.adapters.base import Credentials
-from dbt.dataclass_schema import dbtClassMixin
+from dbt_common.dataclass_schema import dbtClassMixin
+from dbt_common.exceptions import DbtRuntimeError
+
+from dbt.adapters.contracts.connection import Credentials
+from dbt.adapters.duckdb.secrets import DEFAULT_SECRET_PREFIX
+from dbt.adapters.duckdb.secrets import Secret
 
 
 @dataclass
@@ -30,7 +31,10 @@ class Attachment(dbtClassMixin):
     read_only: bool = False
 
     def to_sql(self) -> str:
-        base = f"ATTACH '{self.path}'"
+        # remove query parameters (not supported in ATTACH)
+        parsed = urlparse(self.path)
+        path = self.path.replace(f"?{parsed.query}", "")
+        base = f"ATTACH '{path}'"
         if self.alias:
             base += f" AS {self.alias}"
         options = []
@@ -77,6 +81,12 @@ class Retries(dbtClassMixin):
 
 
 @dataclass
+class Extension(dbtClassMixin):
+    name: str
+    repo: str
+
+
+@dataclass
 class DuckDBCredentials(Credentials):
     database: str = "main"
     schema: str = "main"
@@ -87,13 +97,17 @@ class DuckDBCredentials(Credentials):
     config_options: Optional[Dict[str, Any]] = None
 
     # any DuckDB extensions we want to install and load (httpfs, parquet, etc.)
-    extensions: Optional[Tuple[str, ...]] = None
+    extensions: Optional[List[Union[str, Dict[str, str]]]] = None
 
     # any additional pragmas we want to configure on our DuckDB connections;
     # a list of the built-in pragmas can be found here:
     # https://duckdb.org/docs/sql/configuration
     # (and extensions may add their own pragmas as well)
     settings: Optional[Dict[str, Any]] = None
+
+    # secrets for connecting to cloud services AWS S3, Azure, Cloudfare R2,
+    # Google Cloud and Huggingface.
+    secrets: Optional[List[Dict[str, Any]]] = None
 
     # the root path to use for any external materializations that are specified
     # in this dbt project; defaults to "." (the current working directory)
@@ -147,6 +161,10 @@ class DuckDBCredentials(Credentials):
     retries: Optional[Retries] = None
 
     def __post_init__(self):
+        self.settings = self.settings or {}
+        self.secrets = self.secrets or []
+        self._secrets = []
+
         # Add MotherDuck plugin if the path is a MotherDuck database
         # and plugin was not specified in profile.yml
         if self.is_motherduck:
@@ -155,10 +173,47 @@ class DuckDBCredentials(Credentials):
             if "motherduck" not in [plugin.module for plugin in self.plugins]:
                 self.plugins.append(PluginConfig(module="motherduck"))
 
+        # For backward compatibility, to be deprecated in the future
+        if self.use_credential_provider:
+            if self.use_credential_provider == "aws":
+                self.secrets.append({"type": "s3", "provider": "credential_chain"})
+            else:
+                raise ValueError(
+                    "Unsupported value for use_credential_provider: "
+                    + self.use_credential_provider
+                )
+
+        if self.secrets:
+            self._secrets = [
+                Secret.create(
+                    secret_type=secret.pop("type"),
+                    name=secret.pop("name", f"{DEFAULT_SECRET_PREFIX}{num + 1}"),
+                    **secret,
+                )
+                for num, secret in enumerate(self.secrets)
+            ]
+
+    def secrets_sql(self) -> List[str]:
+        return [secret.to_sql() for secret in self._secrets]
+
+    @property
+    def motherduck_attach(self):
+        # Check if any MotherDuck paths are attached
+        attach = []
+        for attached_db in self.attach or []:
+            parsed = urlparse(attached_db.path)
+            if self._is_motherduck(parsed.scheme):
+                attach.append(attached_db)
+        return attach
+
+    @property
+    def is_motherduck_attach(self):
+        return len(self.motherduck_attach) > 0
+
     @property
     def is_motherduck(self):
         parsed = urlparse(self.path)
-        return self._is_motherduck(parsed.scheme)
+        return self._is_motherduck(parsed.scheme) or self.is_motherduck_attach
 
     @staticmethod
     def _is_motherduck(scheme: str) -> bool:
@@ -187,12 +242,12 @@ class DuckDBCredentials(Credentials):
             data["database"] = path_db
         elif path_db and data["database"] != path_db:
             if not data.get("remote"):
-                raise dbt.exceptions.DbtRuntimeError(
+                raise DbtRuntimeError(
                     "Inconsistency detected between 'path' and 'database' fields in profile; "
                     f"the 'database' property must be set to '{path_db}' to match the 'path'"
                 )
         elif not path_db:
-            raise dbt.exceptions.DbtRuntimeError(
+            raise DbtRuntimeError(
                 "Unable to determine target database name from 'path' field in profile"
             )
         return data
@@ -229,52 +284,3 @@ class DuckDBCredentials(Credentials):
             "plugins",
             "disable_transactions",
         )
-
-    def load_settings(self) -> Dict[str, str]:
-        settings = self.settings or {}
-        if self.use_credential_provider:
-            if self.use_credential_provider == "aws":
-                settings.update(_load_aws_credentials(ttl=_get_ttl_hash()))
-            else:
-                raise ValueError(
-                    "Unsupported value for use_credential_provider: "
-                    + self.use_credential_provider
-                )
-        return settings
-
-
-def _get_ttl_hash(seconds=300):
-    return round(time.time() / seconds)
-
-
-@lru_cache()
-def _load_aws_credentials(ttl=None) -> Dict[str, Any]:
-    """
-    Load AWS credentials from the environment.
-
-    This function is cached to prevent unnecessary calls to the AWS API.
-
-    :param ttl: Time to live for the cache. If None, the cache will not expire.
-    :return: A dictionary containing the AWS credentials which can be used to configure DuckDB settings.
-    """
-    del ttl  # make mypy happy
-    import boto3.session
-
-    session = boto3.session.Session()
-
-    # use STS to verify that the credentials are valid; we will
-    # raise a helpful error here if they are not
-    sts = session.client("sts")
-    sts.get_caller_identity()
-
-    # now extract/return them
-    aws_creds = session.get_credentials().get_frozen_credentials()
-
-    credentials = {
-        "s3_access_key_id": aws_creds.access_key,
-        "s3_secret_access_key": aws_creds.secret_key,
-        "s3_session_token": aws_creds.token,
-        "s3_region": session.region_name,
-    }
-    # only return if value is filled
-    return {k: v for k, v in credentials.items() if v}

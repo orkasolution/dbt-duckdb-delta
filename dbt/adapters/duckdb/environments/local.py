@@ -1,10 +1,12 @@
 import threading
 
+from dbt_common.exceptions import DbtRuntimeError
+
 from . import Environment
 from .. import credentials
 from .. import utils
-from dbt.contracts.connection import AdapterResponse
-from dbt.exceptions import DbtRuntimeError
+from dbt.adapters.contracts.connection import AdapterResponse
+from dbt.adapters.contracts.connection import Connection
 
 
 class DuckDBCursorWrapper:
@@ -57,6 +59,13 @@ class LocalEnvironment(Environment):
             self.handle_count -= 1
             if self.handle_count == 0 and not self._keep_open:
                 self.close()
+
+    def is_cancelable(cls):
+        return True
+
+    @classmethod
+    def cancel(cls, connection: Connection):
+        connection.handle.cursor().interrupt()
 
     def handle(self):
         # Extensions/settings need to be configured per cursor
@@ -145,12 +154,20 @@ class LocalEnvironment(Environment):
         just_register: bool = False,
     ) -> None:
         # some plugin have to be initialized on the fly? glue for example?
-
         if plugin_name not in self._plugins:
-            raise Exception(
-                f"Plugin {plugin_name} not found; known plugins are: "
-                + ",".join(self._plugins.keys())
-            )
+            if plugin_name.startswith("glue|"):
+                from ..plugins import glue
+                _, glue_db = plugin_name.split("|")
+                config = (self.creds.settings or {}).copy()
+                config["glue_database"] = glue_db
+                self._plugins[plugin_name] = glue.Plugin(
+                    name=plugin_name, plugin_config=config, credentials=self.creds
+                )
+            else:
+                raise Exception(
+                    f"Plugin {plugin_name} not found; known plugins are: "
+                    + ",".join(self._plugins.keys())
+                )
         plugin = self._plugins[plugin_name]
 
         # e.g add file format to the location

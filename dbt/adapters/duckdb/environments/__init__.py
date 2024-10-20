@@ -9,14 +9,16 @@ from typing import List
 from typing import Optional
 
 import duckdb
+from dbt_common.exceptions import DbtRuntimeError
 
 from ..credentials import DuckDBCredentials
 from ..credentials import PluginConfig
+from ..credentials import Extension
 from ..plugins import BasePlugin
 from ..utils import SourceConfig
 from ..utils import TargetConfig
-from dbt.contracts.connection import AdapterResponse
-from dbt.exceptions import DbtRuntimeError
+from dbt.adapters.contracts.connection import AdapterResponse
+from dbt.adapters.contracts.connection import Connection
 
 
 def _ensure_event_loop():
@@ -87,7 +89,7 @@ class Environment(abc.ABC):
                 if path not in sys.path:
                     sys.path.append(path)
 
-        major, minor, patch = [int(x) for x in duckdb.__version__.split(".")]
+        major, minor, patch = [int(x) for x in duckdb.__version__.split("-")[0].split(".")]
         if major == 0 and (minor < 10 or (minor == 10 and patch == 0)):
             self._supports_comments = False
         else:
@@ -120,6 +122,16 @@ class Environment(abc.ABC):
 
     def supports_comments(self) -> bool:
         return self._supports_comments
+
+    @classmethod
+    @abc.abstractmethod
+    def is_cancelable(cls) -> bool:
+        pass
+
+    @classmethod
+    @abc.abstractmethod
+    def cancel(cls, connection: Connection):
+        pass
 
     @classmethod
     def initialize_db(
@@ -159,8 +171,20 @@ class Environment(abc.ABC):
         # install any extensions on the connection
         if creds.extensions is not None:
             for extension in creds.extensions:
-                conn.install_extension(extension)
-                conn.load_extension(extension)
+                if isinstance(extension, str):
+                    conn.install_extension(extension)
+                    conn.load_extension(extension)
+                elif isinstance(extension, dict):
+                    try:
+                        ext = Extension(**extension)
+                    except Exception as e:
+                        raise DbtRuntimeError(f"Failed to parse extension: {e}")
+                    conn.execute(f"install {ext.name} from {ext.repo}")
+                    conn.load_extension(ext.name)
+
+        # Create/update secrets on the database
+        for sql in creds.secrets_sql():
+            conn.execute(sql)
 
         # Attach any fsspec filesystems on the database
         if creds.filesystems:
@@ -172,16 +196,16 @@ class Environment(abc.ABC):
                 fs = fsspec.filesystem(fsimpl, **curr)
                 conn.register_filesystem(fs)
 
-        # attach any databases that we will be using
-        if creds.attach:
-            for attachment in creds.attach:
-                conn.execute(attachment.to_sql())
-
         # let the plugins do any configuration on the
         # connection that they need to do
         if plugins:
             for plugin in plugins.values():
                 plugin.configure_connection(conn)
+
+        # attach any databases that we will be using
+        if creds.attach:
+            for attachment in creds.attach:
+                conn.execute(attachment.to_sql())
 
         return conn
 
@@ -193,10 +217,11 @@ class Environment(abc.ABC):
         plugins: Optional[Dict[str, BasePlugin]] = None,
         registered_df: dict = {},
     ):
-        for key, value in creds.load_settings().items():
-            # Okay to set these as strings because DuckDB will cast them
-            # to the correct type
-            cursor.execute(f"SET {key} = '{value}'")
+        if creds.settings is not None:
+            for key, value in creds.settings.items():
+                # Okay to set these as strings because DuckDB will cast them
+                # to the correct type
+                cursor.execute(f"SET {key} = '{value}'")
 
         # update cursor if something is lost in the copy
         # of the parent connection
@@ -221,7 +246,9 @@ class Environment(abc.ABC):
         for plugin_def in creds.plugins or [] + [PluginConfig("native")]:
             config = base_config.copy()
             config.update(plugin_def.config or {})
-            plugin = BasePlugin.create(plugin_def.module, config=config, alias=plugin_def.alias)
+            plugin = BasePlugin.create(
+                plugin_def.module, config=config, alias=plugin_def.alias, credentials=creds
+            )
             ret[plugin.name] = plugin
         return ret
 
@@ -280,6 +307,10 @@ def create(creds: DuckDBCredentials) -> Environment:
         from .buenavista import BVEnvironment
 
         return BVEnvironment(creds)
+    elif creds.is_motherduck:
+        from .motherduck import MotherDuckEnvironment
+
+        return MotherDuckEnvironment(creds)
     else:
         from .local import LocalEnvironment
 
