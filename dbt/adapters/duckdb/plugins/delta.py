@@ -135,6 +135,7 @@ class Plugin(BasePlugin):
                 data=arrow_df,
                 mode=mode,
                 storage_options=storage_options,
+                overwriteSchema=True,  # Allow schema evolution by enabling schema overwrite
             )
 
 
